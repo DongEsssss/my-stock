@@ -77,6 +77,30 @@ type TradeTick = {
   side: 'BUY' | 'SELL';
 };
 
+/** 모의투자 보유 종목 타입 (localStorage 영구 저장) */
+type HoldingItem = {
+  symbol: string;
+  name: string;
+  market: string;
+  quantity: number;     // 보유 수량
+  avgPrice: number;     // 매수 평균단가 (국장은 KRW, 미장은 USD)
+  currency: 'KRW' | 'USD';
+  lastPrice: number;    // 가장 최근 확인된 현재가
+};
+
+/** 모의투자 체결 내역 로그 타입 */
+type OrderHistoryItem = {
+  id: string;
+  time: string;
+  symbol: string;
+  name: string;
+  side: 'BUY' | 'SELL';
+  price: number;
+  quantity: number;
+  currency: 'KRW' | 'USD';
+  totalKRW: number;
+};
+
 // <select> 태그에서 사용할 8가지 주기 타입
 type TimeframeOption = '1m' | '3m' | '5m' | '10m' | '30m' | '60m' | '6h' | '24h';
 
@@ -91,7 +115,16 @@ const TIMEFRAME_LIST: { value: TimeframeOption; label: string; minutes: number }
   { value: '24h', label: '24시간 (일봉)', minutes: 1440 },
 ];
 
+// localStorage 저장 키 상수
 const FAVORITES_STORAGE_KEY = 'my_favorite_stocks_v1';
+const PAPER_CASH_STORAGE_KEY = 'my_paper_cash_krw_v1';
+const PAPER_HOLDINGS_STORAGE_KEY = 'my_paper_holdings_v1';
+const PAPER_HISTORY_STORAGE_KEY = 'my_paper_history_v1';
+
+// 미국 주식(USD) 원화 환산 기준 환율 (1 USD = 1,380 KRW)
+const USD_TO_KRW_RATE = 1380;
+// 최초 접속 시 기본 제공 모의 캐시 (5,000만 원)
+const INITIAL_DEFAULT_CASH = 50_000_000;
 
 // 소수점 둘째 자리까지 항상 포맷팅하는 함수 (예: 1 -> "1.00", 1234.5 -> "1,234.50")
 function formatTwoDecimals(num: number): string {
@@ -107,7 +140,7 @@ function toNum(val: unknown): number {
 }
 
 /**
- * 숫자(초/밀리초)와 날짜 문자열 모두 한국 표준시(KST, UTC+9) 차트 타임스탬프로 일관되게 변환합니다.
+ * 숫자(초/밀리초)와 날짜 문자열 모두 한국 표준시(KST, UTC+9) 차트 타임스탬프로 변환합니다.
  */
 function toUnixTime(rawTime: unknown): UTCTimestamp | null {
   if (!rawTime) return null;
@@ -176,8 +209,6 @@ function parseCandles(json: Record<string, unknown> | null): CandlePoint[] {
 
 /**
  * Investing.com 기준 정규장(Regular Trading Hours) 캔들만 필터링하는 헬퍼 함수
- * - 국내 주식(KRX): KST 09:00 ~ 15:30
- * - 미국 주식(US): 미 동부시간(EST/EDT) 09:30 ~ 16:00
  */
 function filterRegularSessionCandles(
   candles: CandlePoint[],
@@ -187,19 +218,15 @@ function filterRegularSessionCandles(
   if (timeframe === '24h' || candles.length === 0) return candles;
 
   const filtered = candles.filter((c) => {
-    // c.time은 이미 KST(+9h) 오프셋이 적용된 초 단위 타임스탬프
     const utcMs = (Number(c.time) - 9 * 3600) * 1000;
 
     if (isKR) {
-      // KST 기준 시/분 계산
       const kstDate = new Date(Number(c.time) * 1000);
       const hours = kstDate.getUTCHours();
       const minutes = kstDate.getUTCMinutes();
       const totalMinutes = hours * 60 + minutes;
-      // 국내 정규장: 09:00(540분) ~ 15:30(930분)
       return totalMinutes >= 540 && totalMinutes <= 930;
     } else {
-      // 미국 동부시간(America/New_York) 기준 시/분 추출
       const parts = new Intl.DateTimeFormat('en-US', {
         timeZone: 'America/New_York',
         hour: '2-digit',
@@ -209,12 +236,10 @@ function filterRegularSessionCandles(
       const hour = Number(parts.find((p) => p.type === 'hour')?.value ?? 0);
       const minute = Number(parts.find((p) => p.type === 'minute')?.value ?? 0);
       const totalMinutes = hour * 60 + minute;
-      // 미국 정규장: 09:30(570분) ~ 16:00(960분)
       return totalMinutes >= 570 && totalMinutes <= 960;
     }
   });
 
-  // 휴장 시간대여서 필터 결과가 너무 적으면 원본 유지
   return filtered.length >= 15 ? filtered : candles;
 }
 
@@ -270,11 +295,7 @@ function calculateBollinger(candles: CandlePoint[], period = 20, mult = 2) {
 }
 
 /**
- * ★ Investing.com / TradingView 공식 Wilder's RSI (RMA / SMMA 기반) 계산 함수
- * - 단순 14개 평균(SMA)이 아닌 Wilder의 지수이동평균 점화식:
- *   avgGain = (prevAvgGain * 13 + currentGain) / 14
- *   avgLoss = (prevAvgLoss * 13 + currentLoss) / 14
- * - 백필 구간에서 주기(해상도)가 바뀌는 경계를 자동 감지해 분봉 왜곡을 방지합니다.
+ * 금융권 표준 '동일 주기 워밍업(Warm-up) 구간' 기반 Wilder's RSI (14) 계산 함수
  */
 function calculateWilderRSIMap(
   candles: CandlePoint[],
@@ -286,64 +307,53 @@ function calculateWilderRSIMap(
     return { latestRSI: 50, rsiByTime };
   }
 
-  // 백필된 이종 주기(예: 일봉 -> 시간봉 -> 분봉) 경계를 판별하기 위한 기준 시간 간격(초)
-  const expectedStepSec = Math.max(60, timeframeMinutes * 60);
+  let startIdx = 0;
+  if (timeframeMinutes < 60) {
+    startIdx = Math.max(0, candles.length - 1500);
+  } else if (timeframeMinutes < 1440) {
+    for (let i = candles.length - 1; i > 0; i--) {
+      const gapSec = Number(candles[i].time) - Number(candles[i - 1].time);
+      if (gapSec >= 86400 && candles.length - i >= 250) {
+        startIdx = i;
+        break;
+      }
+    }
+  }
+
+  const targetCandles = candles.slice(startIdx);
+  if (targetCandles.length <= period) {
+    return { latestRSI: 50, rsiByTime };
+  }
 
   let avgGain = 0;
   let avgLoss = 0;
-  let seedCount = 0;
-  let isSeeded = false;
-  let latestRSI = 50;
 
-  for (let i = 1; i < candles.length; i++) {
-    const prev = candles[i - 1];
-    const curr = candles[i];
-    const gapSec = Number(curr.time) - Number(prev.time);
+  for (let i = 1; i <= period; i++) {
+    const diff = targetCandles[i].close - targetCandles[i - 1].close;
+    if (diff > 0) avgGain += diff;
+    else avgLoss += -diff;
+  }
 
-    // 분봉/시간봉 차트에서 과거 일봉(24시간 간격) 백필 구간과 만나는 경계에서는
-    // 일봉의 큰 가격 변동폭이 분봉 RMA 평균을 왜곡하지 않도록 시드를 재시작합니다.
-    if (
-      timeframeMinutes < 1440 &&
-      gapSec >= 86400 &&
-      expectedStepSec < 21600 &&
-      candles.length - i > period + 5
-    ) {
-      avgGain = 0;
-      avgLoss = 0;
-      seedCount = 0;
-      isSeeded = false;
-      continue;
-    }
+  avgGain /= period;
+  avgLoss /= period;
 
-    const diff = curr.close - prev.close;
+  const firstRS = avgLoss === 0 ? 100 : avgGain / avgLoss;
+  let latestRSI = Number((avgLoss === 0 ? 100 : 100 - 100 / (1 + firstRS)).toFixed(2));
+  rsiByTime.set(Number(targetCandles[period].time), latestRSI);
+
+  for (let i = period + 1; i < targetCandles.length; i++) {
+    const diff = targetCandles[i].close - targetCandles[i - 1].close;
     const gain = diff > 0 ? diff : 0;
     const loss = diff < 0 ? -diff : 0;
 
-    if (!isSeeded) {
-      avgGain += gain;
-      avgLoss += loss;
-      seedCount += 1;
+    avgGain = (avgGain * (period - 1) + gain) / period;
+    avgLoss = (avgLoss * (period - 1) + loss) / period;
 
-      if (seedCount === period) {
-        avgGain /= period;
-        avgLoss /= period;
-        isSeeded = true;
+    const rs = avgLoss === 0 ? 100 : avgGain / avgLoss;
+    const rsi = avgLoss === 0 ? 100 : 100 - 100 / (1 + rs);
 
-        const rs = avgLoss === 0 ? 100 : avgGain / avgLoss;
-        const rsi = avgLoss === 0 ? 100 : 100 - 100 / (1 + rs);
-        latestRSI = Number(rsi.toFixed(2));
-        rsiByTime.set(Number(curr.time), latestRSI);
-      }
-    } else {
-      // Wilder's Smoothing (RMA) 점화식
-      avgGain = (avgGain * (period - 1) + gain) / period;
-      avgLoss = (avgLoss * (period - 1) + loss) / period;
-
-      const rs = avgLoss === 0 ? 100 : avgGain / avgLoss;
-      const rsi = avgLoss === 0 ? 100 : 100 - 100 / (1 + rs);
-      latestRSI = Number(rsi.toFixed(2));
-      rsiByTime.set(Number(curr.time), latestRSI);
-    }
+    latestRSI = Number(rsi.toFixed(2));
+    rsiByTime.set(Number(targetCandles[i].time), latestRSI);
   }
 
   return { latestRSI, rsiByTime };
@@ -383,15 +393,28 @@ export default function StockChart({
   const [isChartLoading, setIsChartLoading] = useState<boolean>(true);
   const [favorites, setFavorites] = useState<StockItem[]>([]);
 
-  // ★ <select> 태그로 선택하는 주기 상태 (기본 1분)
+  // 차트 옵션 상태
   const [timeframe, setTimeframe] = useState<TimeframeOption>('1m');
   const [chartType, setChartType] = useState<'candle' | 'area'>('candle');
   const [showMA, setShowMA] = useState<boolean>(true);
   const [showBB, setShowBB] = useState<boolean>(false);
-  // ★ Investing.com과 동일하게 정규장(09:00~15:30 / 09:30~16:00) 기준으로만 계산할지 여부
   const [regularSessionOnly, setRegularSessionOnly] = useState<boolean>(true);
   const [isLive, setIsLive] = useState<boolean>(true);
   const [status, setStatus] = useState('데이터 연결 중...');
+
+  // ★ 모의투자(Paper Trading) 상태 (localStorage 연동)
+  const [paperCashKRW, setPaperCashKRW] = useState<number>(INITIAL_DEFAULT_CASH);
+  const [holdings, setHoldings] = useState<HoldingItem[]>([]);
+  const [orderHistory, setOrderHistory] = useState<OrderHistoryItem[]>([]);
+  const [showCashModal, setShowCashModal] = useState<boolean>(false);
+  const [customCashInput, setCustomCashInput] = useState<string>('50000000');
+
+  // 매수/매도 주문창 입력 상태
+  const [orderSide, setOrderSide] = useState<'BUY' | 'SELL'>('BUY');
+  const [orderPriceMode, setOrderPriceMode] = useState<'MARKET' | 'LIMIT'>('MARKET');
+  const [orderLimitPrice, setOrderLimitPrice] = useState<string>('');
+  const [orderQty, setOrderQty] = useState<string>('1');
+  const [orderFeedback, setOrderFeedback] = useState<string>('');
 
   const [apiMonitor, setApiMonitor] = useState<{
     remaining: string;
@@ -441,12 +464,12 @@ export default function StockChart({
     });
   }, [defaultSymbol, defaultName, defaultMarket]);
 
-  // 1. localStorage 관심종목 로드
+  // 1. localStorage에서 관심종목 + 모의 캐시 + 보유종목 + 주문내역 불러오기
   useEffect(() => {
     try {
-      const saved = window.localStorage.getItem(FAVORITES_STORAGE_KEY);
-      if (saved) {
-        setFavorites(JSON.parse(saved));
+      const savedFavs = window.localStorage.getItem(FAVORITES_STORAGE_KEY);
+      if (savedFavs) {
+        setFavorites(JSON.parse(savedFavs));
       } else {
         const initial: StockItem[] = [
           { symbol: '005930', name: '삼성전자', market: 'KOSPI' },
@@ -457,10 +480,51 @@ export default function StockChart({
         setFavorites(initial);
         window.localStorage.setItem(FAVORITES_STORAGE_KEY, JSON.stringify(initial));
       }
+
+      const savedCash = window.localStorage.getItem(PAPER_CASH_STORAGE_KEY);
+      if (savedCash !== null && !Number.isNaN(Number(savedCash))) {
+        setPaperCashKRW(Number(savedCash));
+        setCustomCashInput(String(Math.floor(Number(savedCash))));
+      } else {
+        window.localStorage.setItem(PAPER_CASH_STORAGE_KEY, String(INITIAL_DEFAULT_CASH));
+      }
+
+      const savedHoldings = window.localStorage.getItem(PAPER_HOLDINGS_STORAGE_KEY);
+      if (savedHoldings) {
+        setHoldings(JSON.parse(savedHoldings));
+      }
+
+      const savedHistory = window.localStorage.getItem(PAPER_HISTORY_STORAGE_KEY);
+      if (savedHistory) {
+        setOrderHistory(JSON.parse(savedHistory));
+      }
     } catch (e) {
-      console.error('관심종목 로드 실패:', e);
+      console.error('로컬 스토리지 로드 실패:', e);
     }
   }, []);
+
+  // ★ 모의 캐시 저장 헬퍼 함수
+  const updatePaperCash = (newCash: number) => {
+    const safeCash = Math.max(0, Math.round(newCash));
+    setPaperCashKRW(safeCash);
+    setCustomCashInput(String(safeCash));
+    window.localStorage.setItem(PAPER_CASH_STORAGE_KEY, String(safeCash));
+  };
+
+  // ★ 보유 종목 저장 헬퍼 함수
+  const updateHoldings = (newHoldings: HoldingItem[]) => {
+    setHoldings(newHoldings);
+    window.localStorage.setItem(PAPER_HOLDINGS_STORAGE_KEY, JSON.stringify(newHoldings));
+  };
+
+  // ★ 주문 체결 내역 저장 헬퍼 함수
+  const appendOrderHistory = (item: OrderHistoryItem) => {
+    setOrderHistory((prev) => {
+      const next = [item, ...prev].slice(0, 30);
+      window.localStorage.setItem(PAPER_HISTORY_STORAGE_KEY, JSON.stringify(next));
+      return next;
+    });
+  };
 
   // 2. 종목명 실시간 검색
   useEffect(() => {
@@ -664,7 +728,6 @@ export default function StockChart({
       if (document.visibilityState !== 'visible' && !isInitialLoad) return;
 
       try {
-        // 1) 차트용 캔들 데이터와 2) 전날 종가 계산용 일봉(1d) 데이터를 동시에 요청
         const [chartRes, dailyRes] = await Promise.all([
           fetch(
             `/api/candles?symbol=${currentStock.symbol}&interval=${apiInterval}&count=200`,
@@ -694,12 +757,10 @@ export default function StockChart({
         const rawCandles = parseCandles(chartJson);
         if (rawCandles.length === 0) throw new Error('캔들 데이터 없음');
 
-        // ★ 정규장만 보기(Investing.com 기준)가 켜져 있으면 장외(프리·애프터) 캔들 필터링
         const sessionFilteredCandles = regularSessionOnly
           ? filterRegularSessionCandles(rawCandles, isKRStock, timeframe)
           : rawCandles;
 
-        // ★ 선택한 <select> 주기(1분/3분/5분/10분/30분/60분/6시간/24시간)로 캔들 합산
         const candles = aggregateCandles(sessionFilteredCandles, tfConfig.minutes);
 
         const volumeData = candles.map((c) => ({
@@ -734,7 +795,6 @@ export default function StockChart({
           bbLowerSeries?.setData(bb.lower);
         }
 
-        // ★ 무조건 '전날(직전 거래일) 종가'를 기준으로 상승/하락 금액 및 등락률 계산
         const latest = candles[candles.length - 1];
         const dailyCandles = dailyJson ? parseCandles(dailyJson) : [];
         let prevDayClose =
@@ -755,7 +815,6 @@ export default function StockChart({
         const change = latest.close - prevDayClose;
         const changeRate = prevDayClose !== 0 ? (change / prevDayClose) * 100 : 0;
 
-        // ★ Investing.com 표준 Wilder's RSI (RMA 14) 계산
         const { latestRSI, rsiByTime } = calculateWilderRSIMap(
           candles,
           14,
@@ -777,6 +836,17 @@ export default function StockChart({
             ma5: ma5.length > 0 ? ma5[ma5.length - 1].value : latest.close,
             ma20: ma20.length > 0 ? ma20[ma20.length - 1].value : latest.close,
             ma60: ma60.length > 0 ? ma60[ma60.length - 1].value : latest.close,
+          });
+
+          // 보유 중인 현재 종목의 최신 현재가를 포트폴리오에도 자동 반영
+          setHoldings((prev) => {
+            const exists = prev.some((h) => h.symbol === currentStock.symbol);
+            if (!exists) return prev;
+            const updated = prev.map((h) =>
+              h.symbol === currentStock.symbol ? { ...h, lastPrice: latest.close } : h
+            );
+            window.localStorage.setItem(PAPER_HOLDINGS_STORAGE_KEY, JSON.stringify(updated));
+            return updated;
           });
         }
 
@@ -860,6 +930,166 @@ export default function StockChart({
   const currencySuffix = isKR ? '원' : ' USD';
   const displayMarket = currentStock.market || (isKR ? 'KRX' : 'US');
 
+  // ★ 현재 선택된 종목의 보유 현황 및 주문 단가 계산
+  const currentHolding = holdings.find((h) => h.symbol === currentStock.symbol);
+  const livePrice = quoteSummary?.price ?? 0;
+  const executionUnitPrice =
+    orderPriceMode === 'MARKET'
+      ? livePrice
+      : Number(orderLimitPrice.replace(/,/g, '')) || livePrice;
+  const parsedOrderQty = Math.max(0, Math.floor(Number(orderQty) || 0));
+  const fxRate = isKR ? 1 : USD_TO_KRW_RATE;
+  const estimatedOrderTotalKRW = Math.round(executionUnitPrice * parsedOrderQty * fxRate);
+
+  // ★ 비율 버튼(10%, 25%, 50%, 100%) 클릭 시 주문 수량 자동 입력
+  const handleQuickPercentQty = (percent: number) => {
+    if (orderSide === 'BUY') {
+      if (executionUnitPrice <= 0) return;
+      const unitCostKRW = executionUnitPrice * fxRate;
+      const maxBuyable = Math.floor((paperCashKRW * (percent / 100)) / unitCostKRW);
+      setOrderQty(String(Math.max(1, maxBuyable)));
+    } else {
+      const ownedQty = currentHolding?.quantity ?? 0;
+      const sellQty = Math.floor(ownedQty * (percent / 100));
+      setOrderQty(String(Math.max(1, sellQty)));
+    }
+  };
+
+  // ★ 모의 매수 / 매도 실행 함수 (localStorage 즉시 반영)
+  const handleExecutePaperOrder = () => {
+    if (!quoteSummary || executionUnitPrice <= 0) {
+      setOrderFeedback('⚠️ 시세 불러오기가 완료된 후 주문해 주세요.');
+      return;
+    }
+    if (parsedOrderQty <= 0) {
+      setOrderFeedback('⚠️ 주문 수량을 1주 이상 입력해 주세요.');
+      return;
+    }
+
+    const totalCostKRW = Math.round(executionUnitPrice * parsedOrderQty * fxRate);
+    const currency: 'KRW' | 'USD' = isKR ? 'KRW' : 'USD';
+
+    if (orderSide === 'BUY') {
+      if (totalCostKRW > paperCashKRW) {
+        setOrderFeedback(
+          `❌ 모의 캐시가 부족합니다! (필요: ${totalCostKRW.toLocaleString()}원 / 보유: ${paperCashKRW.toLocaleString()}원)`
+        );
+        return;
+      }
+
+      // 1) 캐시 차감
+      updatePaperCash(paperCashKRW - totalCostKRW);
+
+      // 2) 보유 종목 평단가 및 수량 갱신 (이동평균법)
+      const existing = holdings.find((h) => h.symbol === currentStock.symbol);
+      let nextHoldings: HoldingItem[];
+
+      if (existing) {
+        const newTotalQty = existing.quantity + parsedOrderQty;
+        const newAvgPrice =
+          (existing.avgPrice * existing.quantity + executionUnitPrice * parsedOrderQty) /
+          newTotalQty;
+        nextHoldings = holdings.map((h) =>
+          h.symbol === currentStock.symbol
+            ? {
+                ...h,
+                quantity: newTotalQty,
+                avgPrice: isKR ? Math.round(newAvgPrice) : Number(newAvgPrice.toFixed(2)),
+                lastPrice: livePrice,
+              }
+            : h
+        );
+      } else {
+        nextHoldings = [
+          ...holdings,
+          {
+            symbol: currentStock.symbol,
+            name: currentStock.name,
+            market: displayMarket,
+            quantity: parsedOrderQty,
+            avgPrice: executionUnitPrice,
+            currency,
+            lastPrice: livePrice,
+          },
+        ];
+      }
+
+      updateHoldings(nextHoldings);
+      appendOrderHistory({
+        id: `${Date.now()}`,
+        time: new Date().toLocaleTimeString(),
+        symbol: currentStock.symbol,
+        name: currentStock.name,
+        side: 'BUY',
+        price: executionUnitPrice,
+        quantity: parsedOrderQty,
+        currency,
+        totalKRW: totalCostKRW,
+      });
+
+      setOrderFeedback(
+        `✅ [매수 체결] ${currentStock.name} ${parsedOrderQty.toLocaleString()}주 (${totalCostKRW.toLocaleString()}원)`
+      );
+    } else {
+      // 매도(SELL) 처리
+      const existing = holdings.find((h) => h.symbol === currentStock.symbol);
+      if (!existing || existing.quantity < parsedOrderQty) {
+        setOrderFeedback(
+          `❌ 매도 가능 수량이 부족합니다! (보유: ${existing?.quantity ?? 0}주)`
+        );
+        return;
+      }
+
+      // 1) 매도 대금 캐시 입금
+      updatePaperCash(paperCashKRW + totalCostKRW);
+
+      // 2) 보유 수량 차감 (0주가 되면 목록에서 제거)
+      const remainingQty = existing.quantity - parsedOrderQty;
+      const nextHoldings =
+        remainingQty > 0
+          ? holdings.map((h) =>
+              h.symbol === currentStock.symbol
+                ? { ...h, quantity: remainingQty, lastPrice: livePrice }
+                : h
+            )
+          : holdings.filter((h) => h.symbol !== currentStock.symbol);
+
+      updateHoldings(nextHoldings);
+      appendOrderHistory({
+        id: `${Date.now()}`,
+        time: new Date().toLocaleTimeString(),
+        symbol: currentStock.symbol,
+        name: currentStock.name,
+        side: 'SELL',
+        price: executionUnitPrice,
+        quantity: parsedOrderQty,
+        currency,
+        totalKRW: totalCostKRW,
+      });
+
+      setOrderFeedback(
+        `✅ [매도 체결] ${currentStock.name} ${parsedOrderQty.toLocaleString()}주 (+${totalCostKRW.toLocaleString()}원)`
+      );
+    }
+  };
+
+  // ★ 내 포트폴리오 전체 평가금액 및 수익률 계산
+  const totalHoldingsCostKRW = holdings.reduce((acc, h) => {
+    const rate = h.currency === 'USD' ? USD_TO_KRW_RATE : 1;
+    return acc + h.avgPrice * h.quantity * rate;
+  }, 0);
+
+  const totalHoldingsEvalKRW = holdings.reduce((acc, h) => {
+    const rate = h.currency === 'USD' ? USD_TO_KRW_RATE : 1;
+    const price = h.symbol === currentStock.symbol && livePrice > 0 ? livePrice : h.lastPrice;
+    return acc + price * h.quantity * rate;
+  }, 0);
+
+  const totalProfitKRW = Math.round(totalHoldingsEvalKRW - totalHoldingsCostKRW);
+  const totalProfitRate =
+    totalHoldingsCostKRW > 0 ? (totalProfitKRW / totalHoldingsCostKRW) * 100 : 0;
+  const totalAssetKRW = Math.round(paperCashKRW + totalHoldingsEvalKRW);
+
   const maxOrderbookQty = Math.max(
     1,
     ...asks.map((a) => a.quantity),
@@ -890,7 +1120,7 @@ export default function StockChart({
   return (
     <div
       style={{
-        width: 'min(95vw, 1540px)',
+        width: 'min(96vw, 1600px)',
         marginLeft: '50%',
         transform: 'translateX(-50%)',
         color: '#e5e7eb',
@@ -1115,7 +1345,6 @@ export default function StockChart({
                   </span>
                 </span>
 
-                {/* 무조건 전일 종가 대비 등락폭 & 등락률 소수점 둘째 자리까지 표시 */}
                 <span
                   style={{
                     fontSize: '13px',
@@ -1203,7 +1432,7 @@ export default function StockChart({
       <div
         style={{
           display: 'grid',
-          gridTemplateColumns: 'minmax(0, 1fr) 310px 250px',
+          gridTemplateColumns: 'minmax(0, 1fr) 290px 350px',
           gap: '12px',
           alignItems: 'stretch',
         }}
@@ -1279,7 +1508,6 @@ export default function StockChart({
                   📈 영역선
                 </button>
 
-                {/* <select> 태그로 만든 분봉/시간봉 선택 드롭다운 */}
                 <select
                   value={timeframe}
                   onChange={(e) => setTimeframe(e.target.value as TimeframeOption)}
@@ -1334,11 +1562,9 @@ export default function StockChart({
                   볼린저밴드
                 </button>
 
-                {/* ★ Investing.com과 동일하게 정규장 캔들만 사용할지 선택하는 버튼 */}
                 {timeframe !== '24h' && (
                   <button
                     onClick={() => setRegularSessionOnly((p) => !p)}
-                    title="Investing.com과 동일하게 정규장(09:00~15:30 / 09:30~16:00) 데이터만으로 RSI와 차트를 계산합니다."
                     style={{
                       padding: '6px 12px',
                       borderRadius: '6px',
@@ -1350,7 +1576,7 @@ export default function StockChart({
                       cursor: 'pointer',
                     }}
                   >
-                    {regularSessionOnly ? '🕒 정규장만 (Investing 기준)' : '🌙 시간외 포함 (토스 전체)'}
+                    {regularSessionOnly ? '🕒 정규장만 (Investing 기준)' : '🌙 시간외 포함'}
                   </button>
                 )}
               </div>
@@ -1612,7 +1838,7 @@ export default function StockChart({
           </div>
         </div>
 
-        {/* [2열: 가운데] 호가창 */}
+        {/* [2열: 가운데] 호가창 (호가 클릭 시 지정가 주문창에 자동 입력) */}
         <div
           style={{
             background: '#131722',
@@ -1638,7 +1864,7 @@ export default function StockChart({
               <span style={{ fontWeight: 800, fontSize: '15px', color: '#f3f4f6' }}>
                 호가창 (Orderbook)
               </span>
-              <span style={{ fontSize: '11px', color: '#6b7280' }}>가격 · 잔량</span>
+              <span style={{ fontSize: '11px', color: '#6b7280' }}>클릭 시 주문가 입력</span>
             </div>
 
             <div style={{ display: 'flex', flexDirection: 'column', gap: '4px', marginBottom: '8px' }}>
@@ -1647,6 +1873,11 @@ export default function StockChart({
                 return (
                   <div
                     key={`ask-${idx}`}
+                    onClick={() => {
+                      setOrderPriceMode('LIMIT');
+                      setOrderLimitPrice(String(row.price));
+                    }}
+                    title="클릭하면 이 가격으로 지정가 주문 단가가 설정됩니다"
                     style={{
                       position: 'relative',
                       display: 'flex',
@@ -1657,6 +1888,7 @@ export default function StockChart({
                       background: 'rgba(49, 130, 246, 0.06)',
                       borderRadius: '5px',
                       overflow: 'hidden',
+                      cursor: 'pointer',
                     }}
                   >
                     <div
@@ -1682,6 +1914,10 @@ export default function StockChart({
 
             {quoteSummary && (
               <div
+                onClick={() => {
+                  setOrderPriceMode('MARKET');
+                  setOrderLimitPrice(String(quoteSummary.price));
+                }}
                 style={{
                   padding: '9px 12px',
                   margin: '8px 0',
@@ -1693,6 +1929,7 @@ export default function StockChart({
                   alignItems: 'center',
                   fontSize: '14px',
                   fontWeight: 800,
+                  cursor: 'pointer',
                 }}
               >
                 <span style={{ color: '#9ca3af', fontSize: '12px' }}>현재 체결가</span>
@@ -1708,6 +1945,11 @@ export default function StockChart({
                 return (
                   <div
                     key={`bid-${idx}`}
+                    onClick={() => {
+                      setOrderPriceMode('LIMIT');
+                      setOrderLimitPrice(String(row.price));
+                    }}
+                    title="클릭하면 이 가격으로 지정가 주문 단가가 설정됩니다"
                     style={{
                       position: 'relative',
                       display: 'flex',
@@ -1718,6 +1960,7 @@ export default function StockChart({
                       background: 'rgba(240, 68, 82, 0.06)',
                       borderRadius: '5px',
                       overflow: 'hidden',
+                      cursor: 'pointer',
                     }}
                   >
                     <div
@@ -1764,96 +2007,590 @@ export default function StockChart({
           </div>
         </div>
 
-        {/* [3열: 맨 오른쪽] ★ 관심종목 */}
-        <div
-          style={{
-            background: '#131722',
-            borderRadius: '12px',
-            border: '1px solid #232a3b',
-            padding: '16px',
-            display: 'flex',
-            flexDirection: 'column',
-          }}
-        >
+        {/* [3열: 맨 오른쪽] ★ 모의투자 주문/잔고 + 관심종목 */}
+        <div style={{ display: 'flex', flexDirection: 'column', gap: '12px' }}>
+          {/* 3-1. 모의 캐시 지갑 & 자유 설정 패널 */}
           <div
             style={{
-              display: 'flex',
-              justifyContent: 'space-between',
-              alignItems: 'center',
-              paddingBottom: '10px',
-              borderBottom: '1px solid #1e2433',
-              marginBottom: '12px',
+              background: '#131722',
+              borderRadius: '12px',
+              border: '1px solid #232a3b',
+              padding: '14px 16px',
             }}
           >
-            <span style={{ fontWeight: 800, fontSize: '15px', color: '#f3f4f6' }}>
-              ★ 관심종목 ({favorites.length})
-            </span>
-            <span style={{ fontSize: '11px', color: '#6b7280' }}>Watchlist</span>
-          </div>
-
-          {favorites.length === 0 ? (
             <div
               style={{
-                padding: '30px 10px',
-                textAlign: 'center',
-                color: '#6b7280',
-                fontSize: '13px',
-                lineHeight: 1.6,
+                display: 'flex',
+                justifyContent: 'space-between',
+                alignItems: 'center',
+                marginBottom: '8px',
               }}
             >
-              등록된 관심종목이 없습니다.
-              <br />
-              상단 <strong>[☆ 관심등록]</strong> 버튼을 눌러 추가해 보세요!
+              <span style={{ fontWeight: 800, fontSize: '14px', color: '#f3f4f6' }}>
+                💰 내 모의투자 지갑
+              </span>
+              <button
+                onClick={() => setShowCashModal((p) => !p)}
+                style={{
+                  padding: '4px 10px',
+                  borderRadius: '6px',
+                  border: '1px solid #3182f6',
+                  background: 'rgba(49, 130, 246, 0.15)',
+                  color: '#60a5fa',
+                  fontSize: '11px',
+                  fontWeight: 700,
+                  cursor: 'pointer',
+                }}
+              >
+                {showCashModal ? '닫기' : '⚙️ 캐시 자유설정'}
+              </button>
             </div>
-          ) : (
-            <div style={{ display: 'flex', flexDirection: 'column', gap: '8px', overflowY: 'auto' }}>
-              {favorites.map((fav) => {
-                const isSelected = currentStock.symbol === fav.symbol;
-                return (
-                  <div
-                    key={fav.symbol}
-                    onClick={() => navigateToStock(fav)}
+
+            <div
+              style={{
+                background: '#0b0e14',
+                borderRadius: '8px',
+                padding: '10px 12px',
+                border: '1px solid #1e2433',
+                display: 'flex',
+                flexDirection: 'column',
+                gap: '6px',
+                fontSize: '12px',
+              }}
+            >
+              <div style={{ display: 'flex', justifyContent: 'space-between' }}>
+                <span style={{ color: '#9ca3af' }}>주문가능 모의캐시</span>
+                <strong style={{ color: '#10b981', fontSize: '14px' }}>
+                  {paperCashKRW.toLocaleString()}원
+                </strong>
+              </div>
+              <div style={{ display: 'flex', justifyContent: 'space-between' }}>
+                <span style={{ color: '#9ca3af' }}>총 평가자산 (캐시+주식)</span>
+                <strong style={{ color: '#f9fafb' }}>{totalAssetKRW.toLocaleString()}원</strong>
+              </div>
+              <div style={{ display: 'flex', justifyContent: 'space-between' }}>
+                <span style={{ color: '#9ca3af' }}>보유주식 총손익</span>
+                <strong
+                  style={{
+                    color: totalProfitKRW >= 0 ? '#f04452' : '#3182f6',
+                  }}
+                >
+                  {totalProfitKRW >= 0 ? '+' : ''}
+                  {totalProfitKRW.toLocaleString()}원 ({totalProfitKRW >= 0 ? '+' : ''}
+                  {totalProfitRate.toFixed(2)}%)
+                </strong>
+              </div>
+            </div>
+
+            {/* ★ 내가 마음대로 모의 캐시를 주거나 바꿀 수 있는 설정창 */}
+            {showCashModal && (
+              <div
+                style={{
+                  marginTop: '10px',
+                  padding: '10px',
+                  background: '#191f2e',
+                  borderRadius: '8px',
+                  border: '1px solid #2e3646',
+                  display: 'flex',
+                  flexDirection: 'column',
+                  gap: '8px',
+                }}
+              >
+                <div style={{ fontSize: '11px', color: '#9ca3af' }}>
+                  원하는 모의 캐시 금액(원)을 직접 입력하거나 버튼으로 추가하세요:
+                </div>
+                <div style={{ display: 'flex', gap: '6px' }}>
+                  <input
+                    type="number"
+                    value={customCashInput}
+                    onChange={(e) => setCustomCashInput(e.target.value)}
+                    placeholder="금액 입력 (예: 100000000)"
                     style={{
-                      padding: '12px 14px',
-                      borderRadius: '8px',
-                      background: isSelected ? 'rgba(49, 130, 246, 0.16)' : '#0b0e14',
-                      border: isSelected ? '1px solid #3182f6' : '1px solid #1e2433',
+                      flex: 1,
+                      padding: '6px 10px',
+                      borderRadius: '6px',
+                      border: '1px solid #2e3646',
+                      background: '#0b0e14',
+                      color: '#fff',
+                      fontSize: '12px',
+                    }}
+                  />
+                  <button
+                    onClick={() => {
+                      const val = Number(customCashInput);
+                      if (!Number.isNaN(val) && val >= 0) {
+                        updatePaperCash(val);
+                        setOrderFeedback(`💰 모의 캐시가 ${val.toLocaleString()}원으로 설정되었습니다.`);
+                      }
+                    }}
+                    style={{
+                      padding: '6px 10px',
+                      borderRadius: '6px',
+                      background: '#3182f6',
+                      color: '#fff',
+                      border: 'none',
+                      fontWeight: 700,
+                      fontSize: '11px',
                       cursor: 'pointer',
-                      display: 'flex',
-                      justifyContent: 'space-between',
-                      alignItems: 'center',
                     }}
                   >
-                    <div>
-                      <div style={{ fontWeight: 700, fontSize: '14px', color: '#f3f4f6' }}>
-                        {fav.name}
-                      </div>
-                      <div style={{ fontSize: '11px', color: '#6b7280', marginTop: '3px' }}>
-                        {fav.symbol}
-                      </div>
-                    </div>
+                    잔액 변경
+                  </button>
+                </div>
+
+                <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: '4px' }}>
+                  {[
+                    { label: '+100만', add: 1_000_000 },
+                    { label: '+1,000만', add: 10_000_000 },
+                    { label: '+1억', add: 100_000_000 },
+                    { label: '0원 초기화', add: -paperCashKRW },
+                  ].map((btn) => (
                     <button
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        toggleFavorite(fav);
+                      key={btn.label}
+                      onClick={() => {
+                        updatePaperCash(paperCashKRW + btn.add);
                       }}
-                      title="관심종목 삭제"
                       style={{
-                        background: 'transparent',
-                        border: 'none',
-                        color: '#6b7280',
+                        padding: '5px 4px',
+                        borderRadius: '5px',
+                        border: '1px solid #2e3646',
+                        background: '#0b0e14',
+                        color: '#d1d5db',
+                        fontSize: '11px',
+                        fontWeight: 600,
                         cursor: 'pointer',
-                        fontSize: '14px',
-                        padding: '4px',
                       }}
                     >
-                      ✕
+                      {btn.label}
                     </button>
-                  </div>
-                );
-              })}
+                  ))}
+                </div>
+              </div>
+            )}
+          </div>
+
+          {/* 3-2. 모의 매수 / 매도 주문 패널 */}
+          <div
+            style={{
+              background: '#131722',
+              borderRadius: '12px',
+              border: '1px solid #232a3b',
+              padding: '14px 16px',
+            }}
+          >
+            {/* 매수 / 매도 탭 버튼 */}
+            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '6px', marginBottom: '10px' }}>
+              <button
+                onClick={() => {
+                  setOrderSide('BUY');
+                  setOrderFeedback('');
+                }}
+                style={{
+                  padding: '8px',
+                  borderRadius: '7px',
+                  border: orderSide === 'BUY' ? '1px solid #f04452' : '1px solid #232a3b',
+                  background: orderSide === 'BUY' ? '#f04452' : '#0b0e14',
+                  color: orderSide === 'BUY' ? '#fff' : '#9ca3af',
+                  fontWeight: 800,
+                  fontSize: '13px',
+                  cursor: 'pointer',
+                }}
+              >
+                매수 (Buy)
+              </button>
+              <button
+                onClick={() => {
+                  setOrderSide('SELL');
+                  setOrderFeedback('');
+                }}
+                style={{
+                  padding: '8px',
+                  borderRadius: '7px',
+                  border: orderSide === 'SELL' ? '1px solid #3182f6' : '1px solid #232a3b',
+                  background: orderSide === 'SELL' ? '#3182f6' : '#0b0e14',
+                  color: orderSide === 'SELL' ? '#fff' : '#9ca3af',
+                  fontWeight: 800,
+                  fontSize: '13px',
+                  cursor: 'pointer',
+                }}
+              >
+                매도 (Sell)
+              </button>
             </div>
-          )}
+
+            {/* 시장가 / 지정가 선택 */}
+            <div style={{ display: 'flex', gap: '6px', marginBottom: '8px' }}>
+              <button
+                onClick={() => setOrderPriceMode('MARKET')}
+                style={{
+                  flex: 1,
+                  padding: '5px',
+                  borderRadius: '6px',
+                  border: orderPriceMode === 'MARKET' ? '1px solid #60a5fa' : '1px solid #232a3b',
+                  background: orderPriceMode === 'MARKET' ? 'rgba(49, 130, 246, 0.16)' : '#0b0e14',
+                  color: orderPriceMode === 'MARKET' ? '#60a5fa' : '#9ca3af',
+                  fontSize: '11px',
+                  fontWeight: 700,
+                  cursor: 'pointer',
+                }}
+              >
+                시장가 (현재가 즉시)
+              </button>
+              <button
+                onClick={() => {
+                  setOrderPriceMode('LIMIT');
+                  if (!orderLimitPrice && livePrice > 0) {
+                    setOrderLimitPrice(String(livePrice));
+                  }
+                }}
+                style={{
+                  flex: 1,
+                  padding: '5px',
+                  borderRadius: '6px',
+                  border: orderPriceMode === 'LIMIT' ? '1px solid #60a5fa' : '1px solid #232a3b',
+                  background: orderPriceMode === 'LIMIT' ? 'rgba(49, 130, 246, 0.16)' : '#0b0e14',
+                  color: orderPriceMode === 'LIMIT' ? '#60a5fa' : '#9ca3af',
+                  fontSize: '11px',
+                  fontWeight: 700,
+                  cursor: 'pointer',
+                }}
+              >
+                지정가 (호가클릭/입력)
+              </button>
+            </div>
+
+            {/* 주문 단가 표시/입력 */}
+            <div style={{ marginBottom: '8px' }}>
+              <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '11px', color: '#9ca3af', marginBottom: '4px' }}>
+                <span>주문 단가 ({isKR ? 'KRW' : `USD · 환율 ${USD_TO_KRW_RATE}원`})</span>
+                {currentHolding && (
+                  <span>
+                    현재 보유: <strong style={{ color: '#fff' }}>{currentHolding.quantity}주</strong>
+                  </span>
+                )}
+              </div>
+              {orderPriceMode === 'MARKET' ? (
+                <div
+                  style={{
+                    padding: '8px 12px',
+                    borderRadius: '6px',
+                    background: '#0b0e14',
+                    border: '1px solid #232a3b',
+                    fontSize: '13px',
+                    fontWeight: 700,
+                    color: '#f9fafb',
+                  }}
+                >
+                  현재가 {isKR ? livePrice.toLocaleString() : formatTwoDecimals(livePrice)}
+                  {currencySuffix}
+                </div>
+              ) : (
+                <input
+                  type="number"
+                  value={orderLimitPrice}
+                  onChange={(e) => setOrderLimitPrice(e.target.value)}
+                  placeholder="주문 단가 입력"
+                  style={{
+                    width: '100%',
+                    boxSizing: 'border-box',
+                    padding: '8px 12px',
+                    borderRadius: '6px',
+                    border: '1px solid #3182f6',
+                    background: '#0b0e14',
+                    color: '#fff',
+                    fontSize: '13px',
+                    fontWeight: 700,
+                  }}
+                />
+              )}
+            </div>
+
+            {/* 주문 수량 입력 + 비율 버튼 */}
+            <div style={{ marginBottom: '10px' }}>
+              <div style={{ fontSize: '11px', color: '#9ca3af', marginBottom: '4px' }}>주문 수량 (주)</div>
+              <input
+                type="number"
+                min="1"
+                value={orderQty}
+                onChange={(e) => setOrderQty(e.target.value)}
+                style={{
+                  width: '100%',
+                  boxSizing: 'border-box',
+                  padding: '8px 12px',
+                  borderRadius: '6px',
+                  border: '1px solid #2e3646',
+                  background: '#0b0e14',
+                  color: '#fff',
+                  fontSize: '13px',
+                  fontWeight: 700,
+                  marginBottom: '6px',
+                }}
+              />
+              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: '4px' }}>
+                {[10, 25, 50, 100].map((pct) => (
+                  <button
+                    key={pct}
+                    onClick={() => handleQuickPercentQty(pct)}
+                    style={{
+                      padding: '4px',
+                      borderRadius: '5px',
+                      border: '1px solid #232a3b',
+                      background: '#0b0e14',
+                      color: '#9ca3af',
+                      fontSize: '11px',
+                      fontWeight: 600,
+                      cursor: 'pointer',
+                    }}
+                  >
+                    {pct === 100 ? '최대(100%)' : `${pct}%`}
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            {/* 총 주문 금액 요약 & 주문 실행 버튼 */}
+            <div
+              style={{
+                display: 'flex',
+                justifyContent: 'space-between',
+                fontSize: '12px',
+                marginBottom: '8px',
+                padding: '6px 8px',
+                background: '#0b0e14',
+                borderRadius: '6px',
+              }}
+            >
+              <span style={{ color: '#9ca3af' }}>예상 주문총액(원화)</span>
+              <strong style={{ color: '#f9fafb' }}>{estimatedOrderTotalKRW.toLocaleString()}원</strong>
+            </div>
+
+            <button
+              onClick={handleExecutePaperOrder}
+              style={{
+                width: '100%',
+                padding: '10px',
+                borderRadius: '8px',
+                border: 'none',
+                background: orderSide === 'BUY' ? '#f04452' : '#3182f6',
+                color: '#fff',
+                fontWeight: 800,
+                fontSize: '14px',
+                cursor: 'pointer',
+              }}
+            >
+              {currentStock.name} {orderSide === 'BUY' ? '모의 매수하기' : '모의 매도하기'}
+            </button>
+
+            {orderFeedback && (
+              <div
+                style={{
+                  marginTop: '8px',
+                  fontSize: '11px',
+                  color: '#e5e7eb',
+                  background: '#0b0e14',
+                  padding: '7px 10px',
+                  borderRadius: '6px',
+                  border: '1px solid #232a3b',
+                }}
+              >
+                {orderFeedback}
+              </div>
+            )}
+          </div>
+
+          {/* 3-3. 내 보유종목 (실시간 수익률) */}
+          <div
+            style={{
+              background: '#131722',
+              borderRadius: '12px',
+              border: '1px solid #232a3b',
+              padding: '14px 16px',
+            }}
+          >
+            <div
+              style={{
+                display: 'flex',
+                justifyContent: 'space-between',
+                alignItems: 'center',
+                paddingBottom: '8px',
+                borderBottom: '1px solid #1e2433',
+                marginBottom: '8px',
+              }}
+            >
+              <span style={{ fontWeight: 800, fontSize: '14px', color: '#f3f4f6' }}>
+                💼 내 보유종목 ({holdings.length})
+              </span>
+              <span style={{ fontSize: '11px', color: '#6b7280' }}>클릭 시 차트 이동</span>
+            </div>
+
+            {holdings.length === 0 ? (
+              <div style={{ padding: '14px 6px', textAlign: 'center', color: '#6b7280', fontSize: '12px' }}>
+                보유 중인 주식이 없습니다. 위 주문창에서 모의 매수를 진행해 보세요!
+              </div>
+            ) : (
+              <div style={{ display: 'flex', flexDirection: 'column', gap: '6px', maxHeight: '180px', overflowY: 'auto' }}>
+                {holdings.map((h) => {
+                  const curPrice =
+                    h.symbol === currentStock.symbol && livePrice > 0 ? livePrice : h.lastPrice;
+                  const profitRate =
+                    h.avgPrice > 0 ? ((curPrice - h.avgPrice) / h.avgPrice) * 100 : 0;
+                  const rate = h.currency === 'USD' ? USD_TO_KRW_RATE : 1;
+                  const profitKRW = Math.round((curPrice - h.avgPrice) * h.quantity * rate);
+                  const isPos = profitKRW >= 0;
+
+                  return (
+                    <div
+                      key={h.symbol}
+                      onClick={() =>
+                        navigateToStock({ symbol: h.symbol, name: h.name, market: h.market })
+                      }
+                      style={{
+                        padding: '8px 10px',
+                        borderRadius: '8px',
+                        background: '#0b0e14',
+                        border:
+                          h.symbol === currentStock.symbol
+                            ? '1px solid #3182f6'
+                            : '1px solid #1e2433',
+                        cursor: 'pointer',
+                        display: 'flex',
+                        justifyContent: 'space-between',
+                        alignItems: 'center',
+                        fontSize: '12px',
+                      }}
+                    >
+                      <div>
+                        <div style={{ fontWeight: 700, color: '#f3f4f6' }}>
+                          {h.name}{' '}
+                          <span style={{ color: '#9ca3af', fontWeight: 500 }}>({h.quantity}주)</span>
+                        </div>
+                        <div style={{ fontSize: '11px', color: '#6b7280', marginTop: '2px' }}>
+                          평단{' '}
+                          {h.currency === 'KRW'
+                            ? h.avgPrice.toLocaleString()
+                            : formatTwoDecimals(h.avgPrice)}
+                          {h.currency === 'KRW' ? '원' : '$'}
+                        </div>
+                      </div>
+
+                      <div style={{ textAlign: 'right' }}>
+                        <div
+                          style={{
+                            fontWeight: 800,
+                            color: isPos ? '#f04452' : '#3182f6',
+                          }}
+                        >
+                          {isPos ? '+' : ''}
+                          {profitKRW.toLocaleString()}원
+                        </div>
+                        <div
+                          style={{
+                            fontSize: '11px',
+                            fontWeight: 700,
+                            color: isPos ? '#f04452' : '#3182f6',
+                          }}
+                        >
+                          ({isPos ? '+' : ''}
+                          {profitRate.toFixed(2)}%)
+                        </div>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+          </div>
+
+          {/* 3-4. ★ 관심종목 */}
+          <div
+            style={{
+              background: '#131722',
+              borderRadius: '12px',
+              border: '1px solid #232a3b',
+              padding: '14px 16px',
+              display: 'flex',
+              flexDirection: 'column',
+              flex: 1,
+            }}
+          >
+            <div
+              style={{
+                display: 'flex',
+                justifyContent: 'space-between',
+                alignItems: 'center',
+                paddingBottom: '8px',
+                borderBottom: '1px solid #1e2433',
+                marginBottom: '10px',
+              }}
+            >
+              <span style={{ fontWeight: 800, fontSize: '14px', color: '#f3f4f6' }}>
+                ★ 관심종목 ({favorites.length})
+              </span>
+              <span style={{ fontSize: '11px', color: '#6b7280' }}>Watchlist</span>
+            </div>
+
+            {favorites.length === 0 ? (
+              <div
+                style={{
+                  padding: '20px 10px',
+                  textAlign: 'center',
+                  color: '#6b7280',
+                  fontSize: '12px',
+                  lineHeight: 1.5,
+                }}
+              >
+                등록된 관심종목이 없습니다.
+              </div>
+            ) : (
+              <div style={{ display: 'flex', flexDirection: 'column', gap: '6px', maxHeight: '180px', overflowY: 'auto' }}>
+                {favorites.map((fav) => {
+                  const isSelected = currentStock.symbol === fav.symbol;
+                  return (
+                    <div
+                      key={fav.symbol}
+                      onClick={() => navigateToStock(fav)}
+                      style={{
+                        padding: '9px 12px',
+                        borderRadius: '8px',
+                        background: isSelected ? 'rgba(49, 130, 246, 0.16)' : '#0b0e14',
+                        border: isSelected ? '1px solid #3182f6' : '1px solid #1e2433',
+                        cursor: 'pointer',
+                        display: 'flex',
+                        justifyContent: 'space-between',
+                        alignItems: 'center',
+                      }}
+                    >
+                      <div>
+                        <div style={{ fontWeight: 700, fontSize: '13px', color: '#f3f4f6' }}>
+                          {fav.name}
+                        </div>
+                        <div style={{ fontSize: '11px', color: '#6b7280', marginTop: '2px' }}>
+                          {fav.symbol}
+                        </div>
+                      </div>
+                      <button
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          toggleFavorite(fav);
+                        }}
+                        title="관심종목 삭제"
+                        style={{
+                          background: 'transparent',
+                          border: 'none',
+                          color: '#6b7280',
+                          cursor: 'pointer',
+                          fontSize: '13px',
+                          padding: '4px',
+                        }}
+                      >
+                        ✕
+                      </button>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+          </div>
         </div>
       </div>
     </div>
